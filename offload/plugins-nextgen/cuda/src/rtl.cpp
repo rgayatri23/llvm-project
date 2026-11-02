@@ -100,41 +100,7 @@ struct CUDAKernelTy : public GenericKernelTy {
 
   /// Initialize the CUDA kernel.
   Error initImpl(GenericDeviceTy &GenericDevice,
-                 DeviceImageTy &Image) override {
-    CUresult Res;
-    CUDADeviceImageTy &CUDAImage = static_cast<CUDADeviceImageTy &>(Image);
-
-    // Retrieve the function pointer of the kernel.
-    Res = cuModuleGetFunction(&Func, CUDAImage.getModule(), getName());
-    if (auto Err = Plugin::check(Res, "error in cuModuleGetFunction('%s'): %s",
-                                 getName()))
-      return Err;
-
-    // Check that the function pointer is valid.
-    if (!Func)
-      return Plugin::error(ErrorCode::INVALID_BINARY,
-                           "invalid function for kernel %s", getName());
-
-    int MaxThreads;
-    Res = cuFuncGetAttribute(&MaxThreads,
-                             CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, Func);
-    if (auto Err = Plugin::check(Res, "error in cuFuncGetAttribute: %s"))
-      return Err;
-
-    // The maximum number of threads cannot exceed the maximum of the kernel.
-    MaxNumThreads = std::min(MaxNumThreads, (uint32_t)MaxThreads);
-
-    int SharedMemSize;
-    Res = cuFuncGetAttribute(&SharedMemSize,
-                             CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, Func);
-    if (auto Err = Plugin::check(Res, "Error in cuFuncGetAttribute: %s"))
-      return Err;
-
-    // Set the static block memory size required by the kernel.
-    StaticBlockMemSize = SharedMemSize;
-
-    return Plugin::success();
-  }
+                 DeviceImageTy &Image) override;
 
   /// Launch the CUDA kernel function.
   Error launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads[3],
@@ -274,7 +240,8 @@ struct CUDADeviceTy : public GenericDeviceTy {
   // Create a CUDA device with a device id and the default CUDA grid values.
   CUDADeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
-        CUDAStreamManager(*this), CUDAEventManager(*this) {}
+        CUDAStreamManager(*this), CUDAEventManager(*this),
+        OMPX_SharedMemCarveout("LIBOMPTARGET_CUDA_SHMEM_CARVEOUT", -2) {}
 
   ~CUDADeviceTy() {}
 
@@ -369,9 +336,17 @@ struct CUDADeviceTy : public GenericDeviceTy {
       return Err;
     HardwareParallelism = NumMuliprocessors * (MaxThreadsPerSM / WarpSize);
 
+    // Use the opt-in attribute, not the legacy default (49152 bytes on
+    // every architecture since Volta): the plugin already opts kernels in to
+    // the larger limit via cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)
+    // in launchImpl, but PluginInterface.cpp's prepareBlockMemory() rejects
+    // requests above MaxBlockSharedMemSize before that call ever runs, so
+    // the legacy attribute here silently capped every kernel at ~48KB of
+    // dynamic shared memory regardless of actual hardware/opt-in support.
     uint32_t MaxSharedMem;
-    if (auto Err = getDeviceAttr(
-            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, MaxSharedMem))
+    if (auto Err =
+            getDeviceAttr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                          MaxSharedMem))
       return Err;
     MaxBlockSharedMemSize = MaxSharedMem;
 
@@ -1390,8 +1365,19 @@ struct CUDADeviceTy : public GenericDeviceTy {
     return ComputeCapability.str();
   }
 
+  /// Returns the major compute capability version (e.g. 8 for A100, 9 for
+  /// GH200), for gating features that only make sense on Ampere and newer.
+  uint32_t getComputeCapabilityMajor() const {
+    return ComputeCapability.Major;
+  }
+
   /// Returns the clock frequency for the given NVPTX device.
   uint64_t getClockFrequency() const override { return 1000000000; }
+
+  /// Preferred shared-memory carveout percentage (0-100) for kernels, or -1
+  /// for the CUDA driver default. Values outside [-1, 100] mean "leave the
+  /// kernel's cache configuration untouched" (the default).
+  int32_t getSharedMemCarveout() const { return OMPX_SharedMemCarveout; }
 
 private:
   using CUDAStreamManagerTy = GenericDeviceResourceManagerTy<CUDAStreamRef>;
@@ -1518,6 +1504,12 @@ private:
     }
   } ComputeCapability;
 
+  /// Preferred shared-memory carveout percentage for kernels on this device
+  /// (see CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT). Defaults to
+  /// -2, an out-of-range sentinel meaning "don't touch the kernel's
+  /// carveout"; valid values are -1 (driver default) through 100.
+  Int32Envar OMPX_SharedMemCarveout;
+
   /// The maximum number of warps that can be resident on all the SMs
   /// simultaneously.
   uint32_t HardwareParallelism = 0;
@@ -1528,6 +1520,59 @@ private:
   /// Tracker for virtual address reservations.
   VMemTrackerTy<CUmemGenericAllocationHandle> VMemTracker;
 };
+
+Error CUDAKernelTy::initImpl(GenericDeviceTy &GenericDevice,
+                             DeviceImageTy &Image) {
+  CUresult Res;
+  CUDADeviceImageTy &CUDAImage = static_cast<CUDADeviceImageTy &>(Image);
+
+  // Retrieve the function pointer of the kernel.
+  Res = cuModuleGetFunction(&Func, CUDAImage.getModule(), getName());
+  if (auto Err = Plugin::check(Res, "error in cuModuleGetFunction('%s'): %s",
+                               getName()))
+    return Err;
+
+  // Check that the function pointer is valid.
+  if (!Func)
+    return Plugin::error(ErrorCode::INVALID_BINARY,
+                         "invalid function for kernel %s", getName());
+
+  int MaxThreads;
+  Res = cuFuncGetAttribute(&MaxThreads,
+                           CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, Func);
+  if (auto Err = Plugin::check(Res, "error in cuFuncGetAttribute: %s"))
+    return Err;
+
+  // The maximum number of threads cannot exceed the maximum of the kernel.
+  MaxNumThreads = std::min(MaxNumThreads, (uint32_t)MaxThreads);
+
+  int SharedMemSize;
+  Res = cuFuncGetAttribute(&SharedMemSize,
+                           CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, Func);
+  if (auto Err = Plugin::check(Res, "Error in cuFuncGetAttribute: %s"))
+    return Err;
+
+  // Set the static block memory size required by the kernel.
+  StaticBlockMemSize = SharedMemSize;
+
+  // Shared-memory carveout is a no-op pre-Volta and unreliable on
+  // Volta/Turing; scope this to Ampere (sm_80) and newer, where it's
+  // well-supported.
+  CUDADeviceTy &CUDADevice = static_cast<CUDADeviceTy &>(GenericDevice);
+  if (CUDADevice.getComputeCapabilityMajor() >= 8) {
+    int32_t Carveout = CUDADevice.getSharedMemCarveout();
+    if (Carveout >= -1 && Carveout <= 100) {
+      Res = cuFuncSetAttribute(
+          Func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+          Carveout);
+      if (auto Err = Plugin::check(
+              Res, "error in cuFuncSetAttribute (carveout): %s"))
+        return Err;
+    }
+  }
+
+  return Plugin::success();
+}
 
 Error CUDAKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
                                uint32_t NumThreads[3], uint32_t NumBlocks[3],
